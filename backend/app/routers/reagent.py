@@ -4,9 +4,10 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from app.schemas import ActionResult, EntryPayload, PageResult
-from app.services.reagent import ReagentService
+from app.services.reagent import SORT_FIELDS, ReagentService
 
 router = APIRouter(prefix="/api/reagent", tags=["试剂耗材"])
 
@@ -16,18 +17,73 @@ LIST_FIELDS = ["物料编号", "物料名称", "规格纯度", "批号", "结存
 STATUSES = ["正常可用", "临近有效期", "已冻结", "已耗尽"]
 
 
-@router.get("", response_model=PageResult[dict])
+class ReagentPageResult(PageResult[dict]):
+    """试剂物料分页结果：附带各状态的全量统计，供列表页卡片使用。"""
+
+    summary: dict[str, int] = Field(default_factory=dict)
+
+
+def _parse_conditions(
+    keyword: str | None,
+    spec: str | None,
+    batch: str | None,
+    status: str | None,
+    hide_frozen: bool,
+    sort: str | None,
+    order: str,
+) -> dict[str, Any]:
+    """把查询参数整理成服务层条件；排序字段或方向不认时直接说明原因。"""
+    if status and status not in STATUSES:
+        raise HTTPException(status_code=400, detail=f"物料状态「{status}」不在允许的状态序列里")
+    if sort and sort not in SORT_FIELDS:
+        raise HTTPException(status_code=400, detail=f"排序字段「{sort}」不支持，可选：{'、'.join(SORT_FIELDS)}")
+    if order not in ("asc", "desc"):
+        raise HTTPException(status_code=400, detail="排序方向只支持 asc 或 desc")
+    return {
+        "keyword": keyword,
+        "spec": spec,
+        "batch": batch,
+        "status": status,
+        "hide_frozen": hide_frozen,
+        "sort": sort,
+        "order": order,
+    }
+
+
+@router.get("", response_model=ReagentPageResult)
 def list_entries(
     keyword: str | None = Query(default=None, description="按物料编号检索"),
+    spec: str | None = Query(default=None, description="按规格纯度检索"),
+    batch: str | None = Query(default=None, description="按批号检索"),
     status: str | None = Query(default=None, description="正常可用、临近有效期、已冻结、已耗尽"),
+    hide_frozen: bool = Query(default=False, description="筛掉已冻结物料"),
+    sort: str | None = Query(default=None, description="排序字段，默认按有效期至升序"),
+    order: str = Query(default="asc", description="asc 升序、desc 降序"),
     page: int = 1,
     size: int = 20,
-) -> PageResult[dict]:
-    """按物料编号与状态过滤试剂耗材列表；没有数据时返回空页，不报错。"""
+) -> ReagentPageResult:
+    """按同一组条件过滤、排序、分页试剂物料列表；没有数据时返回空页，不报错。"""
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
-    return PageResult(items=items, total=total, page=page, size=size)
+    conditions = _parse_conditions(keyword, spec, batch, status, hide_frozen, sort, order)
+    items, total, summary = service.list_entries(page=page, size=size, **conditions)
+    return ReagentPageResult(items=items, total=total, page=page, size=size, summary=summary)
+
+
+@router.get("/export")
+def export_entries(
+    keyword: str | None = Query(default=None, description="按物料编号检索"),
+    spec: str | None = Query(default=None, description="按规格纯度检索"),
+    batch: str | None = Query(default=None, description="按批号检索"),
+    status: str | None = Query(default=None, description="正常可用、临近有效期、已冻结、已耗尽"),
+    hide_frozen: bool = Query(default=False, description="筛掉已冻结物料"),
+    sort: str | None = Query(default=None, description="排序字段，默认按有效期至升序"),
+    order: str = Query(default="asc", description="asc 升序、desc 降序"),
+) -> dict[str, Any]:
+    """导出试剂耗材清单：返回当前过滤条件下的全量数据。"""
+    conditions = _parse_conditions(keyword, spec, batch, status, hide_frozen, sort, order)
+    items, total, _ = service.list_entries(page=1, size=10000, **conditions)
+    return {"module": "reagent", "total": total, "items": items}
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -56,10 +112,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出试剂耗材清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "reagent", "total": total, "items": items}
